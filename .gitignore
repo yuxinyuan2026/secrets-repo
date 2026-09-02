@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.env
+.env.local
+*.log
+.DS_Store
+nul
+serve.log
+uv_sync.log
+uv_sync.err
