@@ -1,0 +1,124 @@
+name: Subscription connectivity test
+
+# 手动触发的可复用测试：下载真 mihomo 内核 → 导入订阅 → 逐节点延迟测试 → 用最快节点跑真实流量。
+# 用法：gh workflow run sub-connectivity-test.yml -f sub_url=<订阅地址>
+
+on:
+  workflow_dispatch:
+    inputs:
+      sub_url:
+        description: 'Subscription URL to import'
+        required: false
+        default: 'https://raw.githubusercontent.com/Pawdroid/Free-servers/main/sub'
+      probe_url:
+        description: 'URL used for the delay test'
+        required: false
+        default: 'https://www.gstatic.com/generate_204'
+      test_traffic:
+        description: 'Send real traffic through the fastest node'
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download mihomo
+        run: |
+          set -e
+          VER=v1.19.30
+          curl -sSL --fail -o mihomo.gz \
+            "https://github.com/MetaCubeX/mihomo/releases/download/$VER/mihomo-linux-amd64-$VER.gz"
+          gunzip mihomo.gz
+          chmod +x mihomo
+          ./mihomo -v
+
+      - name: Write config
+        env:
+          SUB_URL: ${{ github.event.inputs.sub_url }}
+        run: |
+          mkdir -p home providers
+          cat > config.yaml <<EOF
+          mixed-port: 7890
+          bind-address: 127.0.0.1
+          external-controller: 127.0.0.1:9090
+          allow-lan: false
+          ipv6: false
+          mode: rule
+          log-level: info
+          proxy-providers:
+            sub:
+              type: http
+              url: "$SUB_URL"
+              interval: 3600
+              path: ./providers/sub.yaml
+              proxy: DIRECT
+          proxy-groups:
+            - name: "TEST"
+              type: select
+              use: [sub]
+          rules:
+            - MATCH,TEST
+          EOF
+          echo "--- config ---"; cat config.yaml
+
+      - name: Start core and inspect import
+        run: |
+          set -e
+          ./mihomo -d ./home -f config.yaml > mihomo.log 2>&1 &
+          for i in $(seq 1 30); do
+            curl -s -o /dev/null http://127.0.0.1:9090/providers/proxies && break
+            sleep 1
+          done
+          sleep 5
+          echo "### 1) provider 导入情况"
+          curl -s http://127.0.0.1:9090/providers/proxies \
+            | jq -r '.providers[] | "  \(.name): \(.proxies|length) nodes (vehicleType=\(.vehicleType), updatedAt=\(.updatedAt))"'
+          echo "### 2) 节点清单"
+          curl -s http://127.0.0.1:9090/providers/proxies/sub \
+            | jq -r '.proxies[] | "  \(.type)  \(.name)"'
+          echo "### 3) 订阅可解析节点数"
+          curl -s http://127.0.0.1:9090/proxies/TEST | jq -r '"  group TEST 成员数: \(.all|length)"'
+
+      - name: Delay test (all nodes)
+        env:
+          PROBE_URL: ${{ github.event.inputs.probe_url }}
+        run: |
+          echo "### 4) 延迟测试 probe=$PROBE_URL (timeout 8000ms)"
+          curl -sG "http://127.0.0.1:9090/group/TEST/delay" \
+               --data-urlencode "url=$PROBE_URL" --data-urlencode "timeout=8000" > delays.json
+          cat delays.json | jq .
+          echo "### 按延迟排序（0 = 超时/不可用）"
+          jq -r 'to_entries | sort_by(.value) | .[] | "  \(.value) ms  \(.key)"' delays.json
+          echo "### 可用节点统计"
+          jq -r '"  可用: \([to_entries[] | select(.value>0)] | length) / 总计: \(length)"' delays.json
+
+      - name: Real traffic through fastest node
+        if: ${{ github.event.inputs.test_traffic == 'true' }}
+        env:
+          PROBE_URL: ${{ github.event.inputs.probe_url }}
+        run: |
+          set -e
+          BEST=$(jq -r 'to_entries | map(select(.value>0)) | sort_by(.value) | .[0].key // empty' delays.json)
+          echo "### 5) 选出最快节点: ${BEST:-（无可用节点）}"
+          if [ -z "$BEST" ]; then echo "没有可用节点，跳过真实流量测试"; exit 0; fi
+          PAYLOAD=$(jq -n --arg n "$BEST" '{name:$n}')
+          curl -s -o /dev/null -X PUT -H 'Content-Type: application/json' -d "$PAYLOAD" \
+               http://127.0.0.1:9090/proxies/TEST
+          sleep 1
+          echo "--- 直连出口 IP（对照）---"
+          curl -s --max-time 15 'https://api.ipify.org?format=json' || true
+          echo
+          echo "--- 走代理出口 IP ---"
+          curl -s --max-time 20 -x http://127.0.0.1:7890 'https://api.ipify.org?format=json' || echo "  (失败)"
+          echo
+          echo "--- 走代理请求目标站点 ---"
+          curl -s -o /dev/null -w "  %{http_code}\n" --max-time 20 -x http://127.0.0.1:7890 "$PROBE_URL" || echo "  (失败)"
+
+      - name: Core log
+        if: always()
+        run: |
+          echo "### mihomo 日志尾部"; tail -30 mihomo.log || true
+          pkill -f 'mihomo -d' || true
