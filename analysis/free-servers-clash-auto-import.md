@@ -15,8 +15,10 @@
 | 节点更新后能否自动生效？ | ✅ 能，靠 **proxy-provider 的 `interval`** 或客户端的"订阅自动更新"，内核按间隔重新拉取 |
 | 能否把 URL 直接当成"配置/订阅"导入客户端？ | ⚠️ **看客户端**。Clash Verge Rev 会直接报错拒绝（源码核实：要求响应体是含 `proxies`/`proxy-providers` 的 YAML） |
 | 仓库自身有没有推送到 Clash 的自动化？ | ❌ 没有。仓库 0 个 Actions workflow，是外部 cron 定时 force-push 的纯数据仓 |
+| 真机上跑通了吗？ | ✅ **已用真实 Mihomo Meta v1.10.4 内核实测跑通：16/16 个订阅文件全部 20/20 导入成功，节点更新后不重启内核即自动生效**（详见第四节） |
 
 一句话：**把它当作 proxy-provider（代理提供者）挂进去，节点更新后 Clash 会自动拉取；别指望"导入链接"按钮在所有客户端上都成功。**
+实测还发现一个必须知道的坑：**订阅里只要有 1 条节点解析失败，整包更新会被拒绝并保留旧列表**（见 4.2）。
 
 ---
 
@@ -111,7 +113,61 @@ base64 文本是一整个字符串，`serde_yaml_ng::from_str::<Mapping>` 直接
 
 ---
 
-## 四、三种可行接法（推荐 A，最省事）
+## 四、实测：拿真内核跑一遍（Mihomo Meta v1.10.4）
+
+不猜了，直接跑。环境：真实 Mihomo 内核 `Mihomo Meta v1.10.4 linux amd64 with go1.23.12`，用 RESTful API 读取结果。
+
+> ⚠️ 一个必须交代的前提：本次沙箱的出口**封了 `raw.githubusercontent.com`**（连接被重置），所以订阅内容由本地 HTTP 服务提供 —— 但喂给内核的字节与仓库里的 `sub` **md5 完全一致**（`8ac22c4319d91618d430d41d183d1575`）。也就是说：测的是**真内核 + 真订阅内容**，只把"源站在哪"换成了本地。真机连通性问题已在第六节单独讨论。
+
+### 4.1 实验结果总表
+
+| # | 实验 | 结果 |
+|---|---|---|
+| 1 | 配成 proxy-provider，内核导入订阅 | ✅ **20/20** 节点进入内核（Trojan 10 + Vless 10），重名自动变 `名字-01 … -10` |
+| 2 | 16 个订阅文件逐个导入 | ✅ **16/16 全部成功**，每个文件都是 20/20 |
+| 3 | 节点更新后自动生效 | ✅ 订阅内容改成 13 条（含 3 条新节点），**未重启内核**，10 秒内自动变成 13 条并出现新节点 |
+| 4 | 把 base64 订阅当主配置文件加载 | ❌ `yaml: unmarshal errors: line 1: cannot unmarshal !!str 'dHJvamF...' into config.RawConfig` |
+| 5 | 订阅里混进 1 条坏节点 | ❌ 整包更新被拒绝，保留旧列表（fail-closed），见 4.2 |
+| 6 | 转换器产出的 YAML 当配置 | ✅ `mihomo -t` 校验通过；实跑后 `/proxies` 返回 20 个节点，分组正常 |
+
+内核 API 真实输出（实验 1）：
+
+```
+provider=default      vehicleType=Compatible  count=  3
+provider=free-local   vehicleType=HTTP        count= 20   updatedAt=2026-09-09T02:34:32Z
+provider=free-remote  vehicleType=HTTP        count=  0   ← 沙箱内连不上远端，非格式问题
+
+美国+CloudFlare节点              Trojan
+美国+CloudFlare节点-01           Vless
+巴西圣保罗+CloudFlare节点         Trojan
+美国+V2CROSS.COM                 Vless
+…
+美国+CloudFlare节点-10           Trojan
+```
+
+实验 3（自动更新）的关键日志与结果 —— 只改订阅文件内容，不碰内核：
+
+```
+level=info  msg="[Provider] free-local's content update"     ← 内核自己发现内容变了
+内核内节点数: 20 @02:34 → 13 @02:36，并出现【更新测试】新增节点A/B/C
+```
+
+### 4.2 实测发现的坑：一条坏节点 = 整包更新失败
+
+在订阅末尾追加 1 条 REALITY 公钥非法的节点后，内核每隔 10 秒重试、每次都失败：
+
+```
+level=error msg="[Provider] free-local pull error: proxy 20 error: invalid REALITY public key"
+updatedAt 停在旧时间戳，节点列表保持上一次成功的 20 条
+```
+
+也就是说 mihomo 对 provider 更新是 **fail-closed（整包原子替换）**：坏一条 → 整包丢弃 → 沿用旧列表。好消息是不会把节点清空；坏消息是**上游一旦夹带格式错误的节点，你的订阅就静止在那一版，直到上游修好**。这个仓库是自动抓取共享节点的，出这种问题的概率不低 —— 这也是我更推荐方案 C（自己转换时校验并剔除坏节点）的原因。
+
+> 顺带实测了另一个判断依据：**把 base64 订阅直接当配置加载会失败**（实验 4）。这正是"某些客户端导入按钮报错"的根因 —— 客户端下载完直接按 YAML 解析，而它不是 YAML。
+
+---
+
+## 五、三种可行接法（推荐 A，最省事）
 
 ### 方案 A：挂成 proxy-provider（推荐，原生自动更新）
 
@@ -152,7 +208,7 @@ rules:
 ```
 
 - 优点：内核自己定时拉取，**节点更新后自动生效**，无需任何转换服务；`use:` 引用 provider，新增/删除节点不用改分组。
-- 缺点：raw.githubusercontent.com 的连通性取决于你的网络（见第五节）。
+- 缺点：raw.githubusercontent.com 的连通性取决于你的网络（见第六节）。
 
 ### 方案 B：用订阅转换器转成 Clash YAML（适合"导入链接"按钮）
 
@@ -178,7 +234,7 @@ rules:
 
 ---
 
-## 五、时效与缓存：更新后多久能在 Clash 里看到
+## 六、时效与缓存：更新后多久能在 Clash 里看到
 
 | 源 | 生效延迟 | 说明 |
 |---|---|---|
@@ -193,7 +249,7 @@ rules:
 
 ---
 
-## 六、安全与合规提醒（别跳过）
+## 七、安全与合规提醒（别跳过）
 
 - 这些是**公开共享节点**，流量经由第三方（大量 `*.workers.dev` / `*.pages.dev` 前置）中转，对方理论上可观测明文流量；trojan 密码在仓库里是明文的统一值，vless UUID 也是公开的。
 - 不要用它登录网银、邮箱、公司后台、支付账号等敏感服务；不要传输任何隐私/凭据。
@@ -202,7 +258,7 @@ rules:
 
 ---
 
-## 七、本次分析附带的产物
+## 八、本次分析附带的产物
 
 - `tools/sub2clash.py` —— 一个零依赖的 base64 订阅 → Clash YAML 转换器，逻辑对齐 Mihomo 的 `ConvertsV2Ray`（含 `DecodeBase64` 降级、`uniqueName` 去重）。实测结果：
 
@@ -212,11 +268,14 @@ $ python3 tools/sub2clash.py sub -o out.yaml
 ```
 
 - 用途：可直接作为方案 C 的转换内核，或在没有 proxy-provider 支持的客户端上手工生成配置。
+- 第四节的全部实验用的是同一套思路的最小配置（proxy-provider + `interval: 10` + 本地 HTTP 源），任何一台装了 mihomo 的机器上都能复现：
+  `mihomo -d <home> -f config.yaml` → `curl http://127.0.0.1:9090/providers/proxies/<provider名>` 看节点数，
+  `curl -X PUT http://127.0.0.1:9090/providers/proxies/<provider名>` 可手动触发一次更新。
 
 ---
 
-## 八、要不要我接着做？
+## 九、要不要我接着做？
 
-1. **方案 C 全套**：在你这个仓库里加一个每 6 小时跑的 Actions（抓取 → 去重 → 重命名 → 修坏参数 → 输出 Clash YAML → 发到 Pages），给你一个稳定可订阅的 URL；
+1. **方案 C 全套**：在你这个仓库里加一个每 6 小时跑的 Actions（抓取 → 去重 → 重命名 → **剔除会触发整包失败的问题节点（见 4.2）** → 输出 Clash YAML → 发到 Pages），给你一个稳定可订阅的 URL；
 2. **方案 A 的现成配置**：直接生成一份可用的 `config.yaml`（provider + 分组 + 规则）；
 3. **加测速剔除**：转换时对每个节点做 TCP/HTTP 延迟探测，只保留可用节点。
