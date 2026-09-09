@@ -4,6 +4,10 @@ name: Subscription connectivity test
 # 用法：gh workflow run sub-connectivity-test.yml -f sub_url=<订阅地址>
 
 on:
+  # 改这个文件并推送即可自动触发，不用去页面上点按钮
+  push:
+    paths:
+      - '.github/workflows/sub-connectivity-test.yml'
   workflow_dispatch:
     inputs:
       sub_url:
