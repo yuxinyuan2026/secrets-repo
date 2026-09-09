@@ -165,6 +165,54 @@ updatedAt 停在旧时间戳，节点列表保持上一次成功的 20 条
 
 > 顺带实测了另一个判断依据：**把 base64 订阅直接当配置加载会失败**（实验 4）。这正是"某些客户端导入按钮报错"的根因 —— 客户端下载完直接按 YAML 解析，而它不是 YAML。
 
+### 4.3 还剩什么没验：节点能不能真的连上
+
+**这一步我在沙箱里测不了，需要你的网络。** 原因：
+
+- 沙箱出口只放行 `github.com` / `api.github.com` / PyPI / npm，**节点 IP:port 一律连不上**（实测 4 个节点全部 `000`，对照 `api.github.com` 为 `200`）；
+- 本仓库的 GitHub Actions 目前是**未启用**状态（workflow 文件已推送，但接口返回 `workflows: total_count=0`、`runs: total_count=0`），所以也没法借 CI 的网络。
+
+因此"延迟多少、能不能上网"留给你自己跑，两种方式：
+
+**方式 1 —— 最快，30 秒，用你已有的 Clash Verge Rev**
+
+1. 配置 → 扩展配置（Merge）→ 新建/编辑，粘贴：
+
+```yaml
+proxy-providers:
+  free-servers:
+    type: http
+    url: "https://raw.githubusercontent.com/Pawdroid/Free-servers/main/sub"
+    interval: 21600
+    path: ./free-servers.yaml
+    health-check:
+      enable: true
+      url: https://www.gstatic.com/generate_204
+      interval: 600
+proxy-groups:
+  - name: "免费节点"
+    type: url-test
+    use: [free-servers]
+    url: https://www.gstatic.com/generate_204
+    interval: 300
+```
+
+2. 保存 → 回到「代理」页：**能看到节点 = 导入成功；有延迟数字 = 能连通**。
+3. ⚠️ 别用「导入链接」按钮，它会报 `profile does not contain proxies or proxy-providers` —— 这不是你操作错了，原因见 3.2。
+
+**方式 2 —— 一次性把 20 个节点全测一遍（含真实流量）**
+
+```powershell
+# 在仓库根目录，PowerShell 里跑
+.\tools\Test-Subscription.ps1
+# 换个语言版本试试（节点集不一样）
+.\tools\Test-Subscription.ps1 -SubUrl "https://raw.githubusercontent.com/Pawdroid/Free-servers/main/static/sub_ja"
+```
+
+它会：下载官方 mihomo 内核 → 把订阅挂成 provider → 打印**每个节点的真实延迟** → 选最快的节点发一个真实请求，对比「直连出口 IP」和「走代理出口 IP」。脚本只监听 127.0.0.1、只结束自己启动的那个内核进程，**不会动你正在运行的 Verge**（端口也刻意避开了 7897）。
+
+**想让我在 CI 里跑也可以**：到 Settings → Actions → General 打开 Actions，我就能在 GitHub 的网络里跑真机测试（workflow 已经写好了：`.github/workflows/sub-connectivity-test.yml`，触发命令 `gh workflow run sub-connectivity-test.yml`）。
+
 ---
 
 ## 五、三种可行接法（推荐 A，最省事）
