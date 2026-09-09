@@ -1,10 +1,12 @@
 name: Subscription connectivity test
 
-# 手动触发的可复用测试：下载真 mihomo 内核 → 导入订阅 → 逐节点延迟测试 → 用最快节点跑真实流量。
-# 用法：gh workflow run sub-connectivity-test.yml -f sub_url=<订阅地址>
+# 触发方式：
+#   1) 改这个文件并推送（自动触发，不用去页面上点按钮）
+#   2) Actions 页面手动 Run workflow
+#
+# 结果会写回仓库的 results/latest.md（因为沙箱/CI 日志外网取不到，直接落成文件最稳）
 
 on:
-  # 改这个文件并推送即可自动触发，不用去页面上点按钮
   push:
     paths:
       - '.github/workflows/sub-connectivity-test.yml'
@@ -24,11 +26,16 @@ on:
         type: boolean
         default: true
 
+permissions:
+  contents: write
+
 jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      - uses: actions/checkout@v4
+
       - name: Download mihomo
         run: |
           set -e
@@ -41,7 +48,7 @@ jobs:
 
       - name: Write config
         env:
-          SUB_URL: ${{ github.event.inputs.sub_url }}
+          SUB_URL: ${{ github.event.inputs.sub_url || 'https://raw.githubusercontent.com/Pawdroid/Free-servers/main/sub' }}
         run: |
           mkdir -p home providers
           cat > config.yaml <<EOF
@@ -51,7 +58,9 @@ jobs:
           allow-lan: false
           ipv6: false
           mode: rule
-          log-level: info
+          log-level: warning
+          profile:
+            store-selected: false
           proxy-providers:
             sub:
               type: http
@@ -66,14 +75,13 @@ jobs:
           rules:
             - MATCH,TEST
           EOF
-          echo "--- config ---"; cat config.yaml
 
       - name: Start core and inspect import
         run: |
           set -e
           ./mihomo -d ./home -f config.yaml > mihomo.log 2>&1 &
-          for i in $(seq 1 30); do
-            curl -s -o /dev/null http://127.0.0.1:9090/providers/proxies && break
+          for i in $(seq 1 40); do
+            curl -s -o /dev/null http://127.0.0.1:9090/version && break
             sleep 1
           done
           sleep 5
@@ -88,41 +96,93 @@ jobs:
 
       - name: Delay test (all nodes)
         env:
-          PROBE_URL: ${{ github.event.inputs.probe_url }}
+          PROBE_URL: ${{ github.event.inputs.probe_url || 'https://www.gstatic.com/generate_204' }}
         run: |
           echo "### 4) 延迟测试 probe=$PROBE_URL (timeout 8000ms)"
           curl -sG "http://127.0.0.1:9090/group/TEST/delay" \
                --data-urlencode "url=$PROBE_URL" --data-urlencode "timeout=8000" > delays.json
-          cat delays.json | jq .
-          echo "### 按延迟排序（0 = 超时/不可用）"
+          echo "--- 原始返回 ---"; jq . delays.json
+          echo "--- 按延迟排序（0 = 超时/不可用）---"
           jq -r 'to_entries | sort_by(.value) | .[] | "  \(.value) ms  \(.key)"' delays.json
-          echo "### 可用节点统计"
-          jq -r '"  可用: \([to_entries[] | select(.value>0)] | length) / 总计: \(length)"' delays.json
+          echo "--- 可用率 ---"
+          jq -r '"  可用 \([to_entries[] | select(.value>0)] | length) / 总计 \(length)"' delays.json
 
       - name: Real traffic through fastest node
-        if: ${{ github.event.inputs.test_traffic == 'true' }}
+        if: ${{ github.event.inputs.test_traffic != 'false' }}
         env:
-          PROBE_URL: ${{ github.event.inputs.probe_url }}
+          PROBE_URL: ${{ github.event.inputs.probe_url || 'https://www.gstatic.com/generate_204' }}
         run: |
-          set -e
           BEST=$(jq -r 'to_entries | map(select(.value>0)) | sort_by(.value) | .[0].key // empty' delays.json)
-          echo "### 5) 选出最快节点: ${BEST:-（无可用节点）}"
+          echo "### 5) 最快节点: ${BEST:-（无可用节点）}"
           if [ -z "$BEST" ]; then echo "没有可用节点，跳过真实流量测试"; exit 0; fi
           PAYLOAD=$(jq -n --arg n "$BEST" '{name:$n}')
-          curl -s -o /dev/null -X PUT -H 'Content-Type: application/json' -d "$PAYLOAD" \
-               http://127.0.0.1:9090/proxies/TEST
+          curl -s -o /dev/null -X PUT -H 'Content-Type: application/json' -d "$PAYLOAD" http://127.0.0.1:9090/proxies/TEST
           sleep 1
           echo "--- 直连出口 IP（对照）---"
-          curl -s --max-time 15 'https://api.ipify.org?format=json' || true
-          echo
+          DIRECT=$(curl -s --max-time 15 'https://api.ipify.org?format=json' || echo '{"ip":"(失败)"}')
+          echo "  $DIRECT"
           echo "--- 走代理出口 IP ---"
-          curl -s --max-time 20 -x http://127.0.0.1:7890 'https://api.ipify.org?format=json' || echo "  (失败)"
-          echo
+          PROXIED=$(curl -s --max-time 20 -x http://127.0.0.1:7890 'https://api.ipify.org?format=json' || echo '{"ip":"(失败)"}')
+          echo "  $PROXIED"
           echo "--- 走代理请求目标站点 ---"
-          curl -s -o /dev/null -w "  %{http_code}\n" --max-time 20 -x http://127.0.0.1:7890 "$PROBE_URL" || echo "  (失败)"
+          curl -s -o /dev/null -w "  HTTP %{http_code} (总耗时 %{time_total}s)\n" --max-time 20 -x http://127.0.0.1:7890 "$PROBE_URL" || echo "  (失败)"
+          echo "DIRECT_IP=$DIRECT" >> $GITHUB_ENV
+          echo "PROXIED_IP=$PROXIED" >> $GITHUB_ENV
+          echo "BEST_NODE=$BEST" >> $GITHUB_ENV
 
-      - name: Core log
+      - name: Write results back to repo
         if: always()
         run: |
-          echo "### mihomo 日志尾部"; tail -30 mihomo.log || true
+          mkdir -p results
+          SUB_URL="${{ github.event.inputs.sub_url || 'https://raw.githubusercontent.com/Pawdroid/Free-servers/main/sub' }}"
+          {
+            echo "# 订阅连通性测试结果"
+            echo
+            echo "- 运行时间: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            echo "- 订阅地址: \`$SUB_URL\`"
+            echo "- 内核: $(./mihomo -v 2>&1 | head -1)"
+            echo "- 网络: GitHub Actions runner (ubuntu-latest)"
+            echo
+            echo "## 1) 导入情况"
+            echo '```'
+            curl -s http://127.0.0.1:9090/providers/proxies 2>/dev/null \
+              | jq -r '.providers[] | "\(.name): \(.proxies|length) nodes (vehicleType=\(.vehicleType))"' || echo "(内核已停止)"
+            echo '```'
+            echo
+            echo "## 2) 节点延迟（0 = 超时/不可用）"
+            echo '```'
+            if [ -f delays.json ]; then
+              jq -r 'to_entries | sort_by(.value) | .[] | "\(.value) ms  \(.key)"' delays.json
+              echo "---"
+              jq -r '可用 \([to_entries[] | select(.value>0)] | length) / 总计 \(length)"' delays.json
+            else
+              echo "(没有延迟数据)"
+            fi
+            echo '```'
+            echo
+            echo "## 3) 真实流量"
+            echo '```'
+            echo "最快节点: ${BEST_NODE:-无}"
+            echo "直连出口  : ${DIRECT_IP:-未测}"
+            echo "走代理出口: ${PROXIED_IP:-未测}"
+            echo '```'
+          } > results/latest.md
+          cp results/latest.md "results/run-${GITHUB_RUN_ID}.md"
+          cat results/latest.md
+
+      - name: Commit results
+        if: always()
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add results
+          if git diff --cached --quiet; then echo "没有变化，跳过提交"; exit 0; fi
+          git commit -m "Update subscription test results (run ${GITHUB_RUN_ID})"
+          git pull --rebase origin "${GITHUB_REF_NAME}" || true
+          git push origin HEAD:"${GITHUB_REF_NAME}"
+
+      - name: Stop core
+        if: always()
+        run: |
+          echo "### mihomo 日志尾部"; tail -20 mihomo.log 2>/dev/null || true
           pkill -f 'mihomo -d' || true
